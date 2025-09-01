@@ -96,6 +96,18 @@ extern VALUE rb_scheduler_timeout(struct timeval *timeout);
 # define rb_fiber_scheduler_make_timeout rb_scheduler_timeout
 #endif
 
+/*
+ * There's a known issue where kqueue systems (HAVE_SYS_EVENT_H) don't work
+ * with `/dev/tty`. As a workaround, when a scheduler is active, we bypass
+ * Ruby's IO layer and use direct blocking read & write syscalls.
+ */
+#ifdef HAVE_SYS_EVENT_H
+extern VALUE rb_fiber_scheduler_current(void);
+#define FIBER_SCHEDULER_SET() (!NIL_P(rb_fiber_scheduler_current()))
+#else
+#define FIBER_SCHEDULER_SET() (0)
+#endif
+
 #ifndef HAVE_RB_IO_DESCRIPTOR
 static int
 io_descriptor_fallback(VALUE io)
@@ -606,8 +618,17 @@ console_getch(int argc, VALUE *argv, VALUE io)
 	    if (w < 0) rb_eof_error();
 	    if (!(w & RB_WAITFD_IN)) return Qnil;
 # else
-	    VALUE result = rb_io_wait(io, RB_INT2NUM(RUBY_IO_READABLE), timeout);
-	    if (!RTEST(result)) return Qnil;
+#  ifdef HAVE_SYS_EVENT_H
+	    if (FIBER_SCHEDULER_SET()) {
+		int w = rb_wait_for_single_fd(fptr->fd, RB_WAITFD_IN, to);
+		if (w < 0) rb_eof_error();
+		if (!(w & RB_WAITFD_IN)) return Qnil;
+	    } else
+#  endif
+	    {
+		VALUE result = rb_io_wait(io, RB_INT2NUM(RUBY_IO_READABLE), timeout);
+		if (!RTEST(result)) return Qnil;
+	    }
 # endif
 	}
 	else if (optp->vtime) {
@@ -1134,6 +1155,13 @@ static int
 direct_query(VALUE io, const struct query_args *query)
 {
     if (RB_TYPE_P(io, T_FILE)) {
+#ifdef HAVE_SYS_EVENT_H
+	if (FIBER_SCHEDULER_SET()) {
+	    ssize_t len = strlen(query->qstr);
+	    ssize_t written = write(GetWriteFD(io), query->qstr, len);
+	    return written == len ? 1 : 0;
+	}
+#endif
         VALUE wio = rb_io_get_write_io(io);
         VALUE s = rb_str_new_cstr(query->qstr);
         rb_io_write(wio, s);
@@ -1141,6 +1169,25 @@ direct_query(VALUE io, const struct query_args *query)
         return 1;
     }
     return 0;
+}
+
+static VALUE
+blocking_io_getbyte(VALUE io)
+{
+    if (RB_TYPE_P(io, T_FILE)) {
+#ifdef HAVE_SYS_EVENT_H
+	if (FIBER_SCHEDULER_SET()) {
+	    unsigned char byte;
+	    ssize_t bytes_read = read(GetReadFD(io), &byte, 1);
+	    if (bytes_read == 1) {
+		return INT2FIX(byte);
+	    }
+	    /* bytes_read == 0 (EOF) or bytes_read == -1 (error) */
+	    return Qnil;
+	}
+#endif
+    }
+    return rb_io_getbyte(io);
 }
 
 static VALUE
@@ -1154,10 +1201,10 @@ read_vt_response(VALUE io, VALUE query)
 	opt = qargs->opt;
 	if (!direct_query(io, qargs)) return Qnil;
     }
-    if (rb_io_getbyte(io) != INT2FIX(0x1b)) return Qnil;
-    if (rb_io_getbyte(io) != INT2FIX('[')) return Qnil;
+    if (blocking_io_getbyte(io) != INT2FIX(0x1b)) return Qnil;
+    if (blocking_io_getbyte(io) != INT2FIX('[')) return Qnil;
     result = rb_ary_new();
-    while (!NIL_P(b = rb_io_getbyte(io))) {
+    while (!NIL_P(b = blocking_io_getbyte(io))) {
 	int c = NUM2UINT(b);
 	if (c == ';') {
 	    rb_ary_push(result, INT2NUM(num));
@@ -1224,6 +1271,7 @@ console_cursor_pos(VALUE io)
     return rb_assoc_new(UINT2NUM(ws.dwCursorPosition.Y), UINT2NUM(ws.dwCursorPosition.X));
 #else
     static const struct query_args query = {"\033[6n", 0};
+
     VALUE resp = console_vt_response(0, 0, io, &query);
     VALUE row, column, term;
     unsigned int r, c;
@@ -1692,23 +1740,22 @@ console_dev(int argc, VALUE *argv, VALUE klass)
 #ifdef CONSOLE_DEVICE_FOR_WRITING
         VALUE out;
 #endif
-        int fd;
         VALUE path = rb_obj_freeze(rb_str_new2(CONSOLE_DEVICE));
 
 #ifdef CONSOLE_DEVICE_FOR_WRITING
-        fd = rb_cloexec_open(CONSOLE_DEVICE_FOR_WRITING, O_RDWR, 0);
-        if (fd < 0) return Qnil;
-        out = rb_io_open_descriptor(klass, fd, FMODE_WRITABLE | FMODE_SYNC, path, Qnil, NULL);
+        int write_fd = rb_cloexec_open(CONSOLE_DEVICE_FOR_WRITING, O_RDWR, 0);
+        if (write_fd < 0) return Qnil;
+        out = rb_io_open_descriptor(klass, write_fd, FMODE_WRITABLE | FMODE_SYNC, path, Qnil, NULL);
 #endif
-        fd = rb_cloexec_open(CONSOLE_DEVICE_FOR_READING, O_RDWR, 0);
-        if (fd < 0) {
+        int read_fd = rb_cloexec_open(CONSOLE_DEVICE_FOR_READING, O_RDWR, 0);
+        if (read_fd < 0) {
 #ifdef CONSOLE_DEVICE_FOR_WRITING
             rb_io_close(out);
 #endif
             return Qnil;
         }
 
-        con = rb_io_open_descriptor(klass, fd, FMODE_READWRITE | FMODE_SYNC, path, Qnil, NULL);
+        con = rb_io_open_descriptor(klass, read_fd, FMODE_READWRITE | FMODE_SYNC, path, Qnil, NULL);
 #ifdef CONSOLE_DEVICE_FOR_WRITING
         rb_io_set_write_io(con, out);
 #endif

@@ -367,6 +367,21 @@ defined?(PTY) and defined?(IO.console) and TestIO_Console.class_eval do
     end
   end
 
+  def test_cursor_position_kqueue_regression
+    run_pty("#{<<~"begin;"}\n#{<<~'end;'}") do |r, w, _|
+      begin;
+        ENV["CONSOLE_LEVEL"] = "fatal"
+        require "async"
+        require "io/console"
+        coords = Async { IO.console.cursor }.wait
+        p coords
+      end;
+      assert_equal("\e[6n", r.readpartial(5))
+      w.print("\e[12;34R"); w.flush
+      assert_equal([11, 33], eval(r.gets))
+    end
+  end
+
   def assert_ctrl(expect, cc, r, w)
     sleep 0.1
     w.print cc
